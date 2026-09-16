@@ -76,7 +76,7 @@ dsn increments per original (pre-split) packet; sub-packets of one split share t
 flowchart TD
     P[packet received] --> E{E > 0?<br/>segmented}
     E -- no --> M1[mid = dsn]
-    E -- yes --> M2[mid = dsn << 8*E | index]
+    E -- yes --> M2[mid = dsn << 8*E &#124; index]
     M1 --> T[dedup table]
     M2 --> T
     T -- exists --> DR[drop]

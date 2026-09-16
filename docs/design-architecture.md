@@ -73,11 +73,11 @@ flowchart TD
 ```mermaid
 flowchart LR
     Q[management request] --> T{recognize}
-    T -- source=0<br/>"SYN?" --> H1[1st handshake<br/>assign bid, register socket, reply SYN!]
-    T -- "ACK!"<br/>source>0 --> H3[3rd handshake<br/>validate socket, assign forwarder]
-    T -- "PING"<br/>source>0 --> HB[heartbeat<br/>reply PONG, refresh liveness]
-    T -- "FIN?"<br/>source>0 --> FW[farewell<br/>remove record, release bid]
-    T -- other --> UN[unknown command dropped]
+    T -->|source=0, SYN?| H1[1st handshake<br/>assign bid, register socket, reply SYN!]
+    T -->|ACK!, source≠0| H3[3rd handshake<br/>validate socket, assign forwarder]
+    T -->|PING, source≠0| HB[heartbeat<br/>reply PONG, refresh liveness]
+    T -->|FIN?, source≠0| FW[farewell<br/>remove record, release bid]
+    T -->|other| UN[unknown command dropped]
 ```
 
 ## 4. Flow Control

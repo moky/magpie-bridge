@@ -73,11 +73,11 @@ flowchart TD
 ```mermaid
 flowchart LR
     Q[管理请求] --> T{识别类型}
-    T -- source=0<br/>“SYN?” --> H1[第一次握手<br/>分配 bid，登记 socket，回 SYN!]
-    T -- “ACK!”<br/>source>0 --> H3[第三次握手<br/>校验 socket，指派转发线程]
-    T -- “PING”<br/>source>0 --> HB[心跳<br/>回 PONG，更新活跃时间]
-    T -- “FIN?”<br/>source>0 --> FW[挥手<br/>删除记录，释放 bid]
-    T -- 其他 --> UN[未知 command 丢弃]
+    T -->|source=0, SYN?| H1[第一次握手<br/>分配 bid，登记 socket，回 SYN!]
+    T -->|ACK!, source≠0| H3[第三次握手<br/>校验 socket，指派转发线程]
+    T -->|PING, source≠0| HB[心跳<br/>回 PONG，更新活跃时间]
+    T -->|FIN?, source≠0| FW[挥手<br/>删除记录，释放 bid]
+    T -->|其他| UN[未知 command 丢弃]
 ```
 
 ## 4. 流量控制

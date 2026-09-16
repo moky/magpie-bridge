@@ -76,7 +76,7 @@ dsn 针对拆分前的原始数据包自增；拆分包各子包 dsn 相同，�
 flowchart TD
     P[收到数据包] --> E{E > 0?<br/>拆分包}
     E -- 否 --> M1[mid = dsn]
-    E -- 是 --> M2[mid = dsn << 8*E | index]
+    E -- 是 --> M2[mid = dsn << 8*E &#124; index]
     M1 --> T[查重表]
     M2 --> T
     T -- 已存在 --> DR[丢弃]
