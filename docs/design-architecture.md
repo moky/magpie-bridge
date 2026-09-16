@@ -1,85 +1,114 @@
 # Magpie Bridge Architecture Design
 
-The network is an **N:1 C-S structure**: S is a discrete relay node serving only clients registered on it; servers are not associated with each other and offer nothing but simple relay.
+The network structure is **N:1 client-server**: server S is a discrete relay node that serves many clients efficiently, but only those registered on it. The server only provides minimal relaying and is not linked to other servers.
 
 ## 1. System Architecture
 
 ```mermaid
-graph TB
-    subgraph CL[Clients]
-        A[Client A<br/>bid=a]
-        B[Client B<br/>bid=b]
-        C[Client C<br/>bid=c]
+flowchart LR
+    subgraph clients
+        C1[Client 1]
+        C2[Client 2]
+        C3[Client N]
     end
-    subgraph SV[Relay Server]
-        S[Server S<br/>yellow_pages: bid→socket]
+    subgraph relay
+        S[Relay server S<br/>single UDP port]
     end
-    A -- "B=1 relay" --> S
-    B -- "B=1 relay" --> S
-    C -- "B=1 relay" --> S
-    S -- "forward by target bid, unchanged" --> A
-    S -- "forward by target bid, unchanged" --> B
-    A -. "B=0 direct" .-> B
-    B -. "B=0 direct" .-> C
+    C1 -->|"UDP packets"| S
+    C2 -->|"UDP packets"| S
+    C3 -->|"UDP packets"| S
+    S -->|"relay by target bid"| C2
+    S -->|"relay by target bid"| C3
+    C1 -. direct B=0 .- C2
 ```
 
-Key points:
+- The server keeps an in-memory **yellow_pages: bid → socket** mapping table;
+- A client applies for a bid (doorplate) via handshake; other clients can then request relaying by bid.
 
-- Direct (B=0, no bid fields) is preferred when possible; otherwise relay via the server (B=1);
-- The server only maps bid→socket via yellow_pages and forwards packets unchanged;
-- Clients obtain a bid by handshake and broadcast it; others relay by that bid.
+## 2. Server Internals (Separated RX/TX)
 
-## 2. Server Internals
+Receiving and forwarding are handled by **separate threads**: the receiver only receives; N=256 forwarding threads only send.
 
 ```mermaid
 flowchart LR
-    UDP[UDP port<br/>receiver thread] -->|packet + socket| PRE[preprocessor thread]
-    PRE -->|validation chain| CHK{target bid?}
-    CHK -- 0 --> MGR[manager thread<br/>handshake/heartbeat/farewell]
-    CHK -- non-0 --> FWD[forwarder threads ×256<br/>n = source bid % 256]
-    MGR --> YP[(yellow_pages<br/>bid→socket)]
-    FWD --> YP
-    FWD -->|forward unchanged| TGT[socket of target bid]
+    UDP[(UDP port<br/>single binding)] --> R[Receiver thread]
+    R -->|"push raw, no judgment"| Q1[Preprocess wait list]
+    Q1 --> PP[Preprocess thread<br/>validate and assign]
+    PP -->|"target=0 system cmds"| MQ[Manage request queue]
+    PP -->|"data packets"| Q2[Forward queues<br/>assigned by source bid mod]
+    MQ --> MT[Manager thread<br/>handshake/heartbeat/wave]
+    Q2 --> FT1[Forward thread 1]
+    Q2 --> FT2[Forward thread 2]
+    Q2 --> FTN[Forward thread 256]
+    MT -->|"SYN! / PONG etc."| UDP
+    FT1 -->|"UDP send"| UDP
+    FT2 -->|"UDP send"| UDP
+    FTN -->|"UDP send"| UDP
 ```
 
-**Preprocessor validation chain** (drop on any failure):
+- **Receiver thread**: binds one UDP port, pushes each packet with its socket info into the preprocess wait list without any judgment. One UDP port means fd usage does not grow with users;
+- **Preprocess thread**: validates and assigns (see below);
+- **Manager thread**: handles system commands such as handshake / heartbeat / wave;
+- **Forward threads (N=256)**: poll and send data packets.
+
+## 3. Preprocess Validation Chain
 
 ```mermaid
 flowchart TD
-    P[dequeue packet] --> V1[validate head]
-    V1 -- error --> DR[drop]
-    V1 -- OK --> V2{B=1?}
+    P[take packet + socket] --> V1{head valid?}
+    V1 -- bad --> DR[drop]
+    V1 -- ok --> V2{B=1?<br/>server only handles bridged}
     V2 -- no --> DR
-    V2 -- yes --> V3{target=0?}
-    V3 -- yes --> M[hand to manager]
-    V3 -- no --> V4{source=0?}
+    V2 -- yes --> V3{target bid = 0?}
+    V3 -- yes --> MG[hand to manager thread]
+    V3 -- no --> V4{source bid = 0?}
     V4 -- yes --> DR
-    V4 -- no --> V5{bid↔socket match?}
+    V4 -- no --> V5{bid matches socket?<br/>lookup yellow_pages}
     V5 -- no --> DR
-    V5 -- yes --> UP[refresh liveness → forwarder]
+    V5 -- yes --> UP[update liveness]
+    UP --> AS[assign forward thread<br/>n = source bid % 256]
 ```
 
-| Thread | Responsibility |
-|---|---|
-| Receiver | Binds one UDP port; enqueues packets without judgment |
-| Preprocessor | Validates head, B=1, target/source legality, bid↔socket match; refreshes liveness |
-| Manager | Handles 1st/3rd handshake, PING, FIN?; unknown command dropped |
-| Forwarder ×256 | Sharded by source bid % 256, breadth-first polling, forward unchanged |
+> source=0 implies target=0 (only true for the 1st handshake packet); source=0 with target≠0 is a bad packet and dropped.
 
-> source=0 exists only in the 1st handshake packet (then target must be 0); source=0 with target≠0 is an error packet and is dropped.
+## 4. Manager Thread
 
-## 3. Manager Thread Handling
+Takes packets from the manage queue and identifies the command type; unknown commands are dropped.
 
 ```mermaid
-flowchart LR
-    Q[management request] --> T{recognize}
-    T -->|source=0, SYN?| H1[1st handshake<br/>assign bid, register socket, reply SYN!]
-    T -->|ACK!, source≠0| H3[3rd handshake<br/>validate socket, assign forwarder]
-    T -->|PING, source≠0| HB[heartbeat<br/>reply PONG, refresh liveness]
-    T -->|FIN?, source≠0| FW[farewell<br/>remove record, release bid]
-    T -->|other| UN[unknown command dropped]
+flowchart TD
+    P[take manage request] --> C{classify}
+    C -->|"source bid = 0<br/>(command should be SYN?)"| H1[1st handshake]
+    C -->|"command = ACK!<br/>source bid > 0"| H3[3rd handshake]
+    C -->|"command = PING<br/>source bid > 0"| HB[heartbeat]
+    C -->|"command = FIN?<br/>source bid > 0"| FW[wave]
+    C -->|"unknown command"| DR[drop]
+    H1 --> H1A[allocate free bid<br/>register socket]
+    H1A --> H1B[reply SYN!<br/>no forward thread assigned]
+    H3 --> H3A[lookup source bid]
+    H3A --> H3B{socket matches?}
+    H3B -- no --> DR
+    H3B -- yes --> H3C[update liveness<br/>assign forward thread]
+    HB --> HB1[reply PONG<br/>update liveness]
+    FW --> FW1[delete record<br/>release bid]
 ```
 
-## 4. Flow Control
+## 5. Forward Threads (N=256)
 
-Forwarder threads throttle (a cap on tasks per time window). Tasks are sharded across 256 threads by `source bid % 256`, so one thread hitting its cap does not affect the others, confining any storm to a very small scope.
+When assigning, the preprocess thread computes `n = (source bid) % N` and hands the packet to thread n; each thread keeps one wait queue per source bid.
+
+```mermaid
+flowchart TD
+    L[start polling] --> S[poll source bids]
+    S --> E{any queue non-empty?}
+    E -- no --> SL[sleep briefly]
+    SL --> L
+    E -- yes --> T[take front packet<br/>lookup target bid]
+    T --> A{exists and active?}
+    A -- no --> DR[drop, next loop]
+    A -- yes --> SEND[send via UDP to<br/>target socket]
+    SEND --> L
+```
+
+- **Breadth-first**: polls queues of all source bids, so one user flooding cannot starve others;
+- **Rate limiting**: a cap on tasks per time unit prevents traffic storms; since work is split across 256 threads, one thread hitting its cap does not affect others, containing storms to a small scope.
