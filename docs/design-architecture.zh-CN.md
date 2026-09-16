@@ -1,83 +1,85 @@
-# Magpie Bridge 架构 — 设计
+# Magpie Bridge 架构设计
 
-> Magpie Bridge 的服务器端架构。
-> 需求来源：`tasks/120-design-architecture.md`。报文格式见
-> `design-protocol.md`；工作流见 `design-workflow.md`。
+网络结构为 **N:1 的 C-S 结构**：S 为离散型转发节点，只为已在本服务器注册的客户端服务；服务器互不关联，只做最简单的转发。
 
-## 1. 网络结构
+## 1. 系统架构
 
-- N:1 的 C-S 结构；服务器 S 为**离散型转发节点**。
-- 一个服务器可以高效地为众多客户端提供转发服务，但仅限于**已在本
-  服务器上注册**的客户端。
-- 服务器只为客户端提供最简单的转发服务，**不与其他服务器关联**。
-
-## 2. 服务器总体设计
-
-- **收发分离**：接收和转发各由单独的线程处理。
-- 服务器在内存中维护一张映射表 **`yellow_pages`**：`bid -> socket`。
-
-数据流：
-
-```
-UDP port
-   |
-   v
-[Receiver thread] --(packet + socket)--> [Preprocessor queue]
-                                               |
-                 +-----------------------------+-----------------+
-                 v                                               v
-        [Manager thread] (target=0)                  [Forward threads x256]
-        handshake / heartbeat / teardown             relay to target socket
+```mermaid
+graph TB
+    subgraph CL[客户端]
+        A[客户端 A<br/>bid=a]
+        B[客户端 B<br/>bid=b]
+        C[客户端 C<br/>bid=c]
+    end
+    subgraph SV[转发服务器]
+        S[服务器 S<br/>yellow_pages: bid→socket]
+    end
+    A -- "B=1 转发" --> S
+    B -- "B=1 转发" --> S
+    C -- "B=1 转发" --> S
+    S -- "按 target bid 原样转发" --> A
+    S -- "按 target bid 原样转发" --> B
+    A -. "B=0 直连" .-> B
+    B -. "B=0 直连" .-> C
 ```
 
-## 3. 线程模型
+要点：
 
-### 3.1 接收线程
+- 可直连时优先直连（B=0，无 bid 字段）；否则经服务器转发（B=1）；
+- 服务器只按 yellow_pages 中 bid→socket 映射转发，不改动数据包；
+- 客户端通过握手申请 bid 并广播，其他客户端凭 bid 请求转发。
 
-- 启动时绑定**一个** UDP 端口。
-- 收到数据包后不做任何判断，直接将数据包与 socket 信息一起塞进预处理
-  线程的等待列表。
-- 由于 UDP 只绑定一个端口，fd 占用不会随客户端数量增长。
+## 2. 服务器内部架构
 
-### 3.2 预处理线程
+```mermaid
+flowchart LR
+    UDP[UDP 端口<br/>接收线程] -->|数据包 + socket| PRE[预处理线程]
+    PRE -->|校验链| CHK{target bid?}
+    CHK -- 0 --> MGR[管理线程<br/>握手/心跳/挥手]
+    CHK -- 非 0 --> FWD[转发线程 ×256<br/>n = source bid % 256]
+    MGR --> YP[(yellow_pages<br/>bid→socket)]
+    FWD --> YP
+    FWD -->|原样转发| TGT[target bid 的 socket]
+```
 
-从等待列表取出数据包，依次处理：
+**预处理校验链**（任一失败即丢弃）：
 
-1. **校验协议头**——有任何错误直接丢弃退出；
-2. **target bid == 0**——交给管理线程；
-3. **source bid == 0**——此处为非法，直接丢弃退出；
-4. 查 `yellow_pages`：source bid 对应的 socket 必须与记录匹配，否则丢弃；
-5. 匹配通过则更新活跃时间，指派给相应转发线程。
+```mermaid
+flowchart TD
+    P[取包] --> V1[校验协议头]
+    V1 -- 错误 --> DR[丢弃]
+    V1 -- OK --> V2{B=1?}
+    V2 -- 否 --> DR
+    V2 -- 是 --> V3{target=0?}
+    V3 -- 是 --> M[交管理线程]
+    V3 -- 否 --> V4{source=0?}
+    V4 -- 是 --> DR
+    V4 -- 否 --> V5{bid↔socket 匹配?}
+    V5 -- 否 --> DR
+    V5 -- 是 --> UP[更新活跃时间 → 转发线程]
+```
 
-> 说明：source bid 为 0 时 target bid 也必定为 0，这种情况只出现在
-> "第一次握手包"中，已被第 2 步分流。
+| 线程 | 职责 |
+|---|---|
+| 接收线程 | 绑定单 UDP 端口，收包即入队，不做判断 |
+| 预处理线程 | 校验协议头、B=1、target/source 合法性、bid↔socket 匹配，更新活跃时间 |
+| 管理线程 | 处理第一次/第三次握手、PING、FIN?；未知 command 丢弃 |
+| 转发线程 ×256 | 按 source bid % 256 分片，广度优先轮询，原样转发 |
 
-### 3.3 管理线程
+> source=0 仅存在于第一次握手包（此时 target 必为 0）；若 source=0 而 target≠0 属错误包直接丢弃。
 
-处理管理请求队列中的数据包：
+## 3. 管理线程处理
 
-| 场景         | 判断依据                     | 动作                                     |
-| ------------ | ---------------------------- | ---------------------------------------- |
-| 第一次握手   | source bid == 0（包体 `SYN`）| 分配空 bid，登记 socket，回复            |
-| 第三次握手   | source bid > 0（包体 `ACK`） | 与记录比较 socket，不符丢弃，一致更新活跃时间 |
-| 心跳         | 包体 `PING`（source bid > 0）| 回复 `PONG`，更新活跃时间                |
-| 挥手         | 包体 `FIN`（source bid > 0） | 删除记录，释放 bid                       |
+```mermaid
+flowchart LR
+    Q[管理请求] --> T{识别类型}
+    T -- source=0<br/>“SYN?” --> H1[第一次握手<br/>分配 bid，登记 socket，回 SYN!]
+    T -- “ACK!”<br/>source>0 --> H3[第三次握手<br/>校验 socket，指派转发线程]
+    T -- “PING”<br/>source>0 --> HB[心跳<br/>回 PONG，更新活跃时间]
+    T -- “FIN?”<br/>source>0 --> FW[挥手<br/>删除记录，释放 bid]
+    T -- 其他 --> UN[未知 command 丢弃]
+```
 
-### 3.4 转发线程（N = 256）
+## 4. 流量控制
 
-- 服务器启动时自动安排 N 条转发线程（默认 256）。
-- 预处理线程分派规则：`n = source bid % N`，将数据包放进第 n 条转发线程
-  的队列。
-- 每条转发线程内部为**每个 source bid** 创建一条等待转发队列。
-
-**转发线程 runloop** —— 公平起见采用"广度优先"轮询：
-
-1. 轮询辖下的 source bid，队列非空则取出队首数据包；
-2. 若所有 bid 均无等待任务，则 sleep 一小段时间后继续下一轮；
-3. 取出包中 target bid，查 `yellow_pages`：记录不存在或不活跃则丢弃，
-   继续下一轮；
-4. 将数据包通过绑定的 UDP 接口发送给 target bid 对应 socket。
-
-**流量控制**：设定规定时间内最多处理任务数的上限，避免流量风暴；由于
-任务已拆分给 256 条线程，单条线程达到上限不影响其他线程，可将风暴控制
-在很小的范围内。
+转发线程限流（设定规定时间内最多处理任务数上限）。任务按 `source bid % 256` 拆分给 256 条线程，单条线程达到上限不影响其他线程，将风暴控制在很小的范围内。

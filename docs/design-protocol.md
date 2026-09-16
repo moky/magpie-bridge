@@ -1,122 +1,120 @@
-# Magpie Bridge Protocol — Design
+# Magpie Bridge Protocol Design
 
-> Wire protocol of Magpie Bridge (Reliable UDP Relay Network).
-> Source of requirements: `tasks/100-design-protocol.md`.
+The protocol format consists of two parts: the **head** and the **body**. The receiver validates every field against the standard; a failing packet is judged an error packet and may be dropped directly.
 
-A frame consists of a **head** and an optional **body**. The receiver MUST
-validate every head field and drop the frame on any violation.
+## 1. Head
 
-## 1. Packet Layout
+Head length ranges from 8 to 32 octets: the first 8 are fixed; the remaining 24 form a variable parameter area assembled by the flags.
 
-```
-+--------------------------------------------------------------+
-| Head (20 octets fixed + optional parameter area)             |
-+--------------------------------------------------------------+
-| Body (0 .. N octets, N = 1200)                               |
-+--------------------------------------------------------------+
-```
+### 1.1 Wire Format
 
-## 2. Head
+> Maximum layout (B/C/D all set, E=4 → 32 octets); real fields are concatenated by flags. index/count width is decided by E (1/2/4 octets).
 
-### 2.1 Magic Code (fixed, 4 octets)
+     0                   1                   2                   3
+     0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |      'M'      |      'P'      |     '\0'      |     '\1'      |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |      type     |   head size   |           body size           |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                        target bridge id                       |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                        source bridge id                       |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                       data serial number                      |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |           data index          |           data count          |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                            command                            |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
-`'M' (0x4D), 'B' (0x42), 0x00, 0x01` — Magpie Bridge v1.
+### 1.2 Magic Code (4 octets)
 
-### 2.2 Meta Field (fixed, 4 octets)
+> MC = ['M', 'P', '\0', '\1'], meaning _Message Protocol v1_ (MP = MagPie / Magpie Protocol / Message Protocol / Message Packet).
 
-| Field        | Width | Meaning                                          |
-| ------------ | ----- | ------------------------------------------------ |
-| Type         | 1     | Packet type + parameter width, see below         |
-| Head Length  | 1     | Head size: 20 / 22 / 24 / 28                     |
-| Body Length  | 2     | Body size; 0 for empty body                      |
+### 1.3 Measuring/Validation Area (4 octets)
 
-**Type** — the low bits select the width of each parameter (`index`, `count`);
-the high bit (0x80) marks an acknowledgement (reply). Four size classes:
+The Type octet: high 4 bits are flags; low 4 bits (E) are the segment parameter width.
 
-| Type (data) | Type (reply) | Parameter width | Message size K        | Class            |
-| ----------- | ------------ | --------------- | --------------------- | ---------------- |
-| 0x00        | 0x80         | none            | miniature (1 packet)  | Micro            |
-| 0x01        | 0x81         | 1 octet         | 1 <= K < 256          | General          |
-| 0x02        | 0x82         | 2 octets        | 256 <= K < 65536      | Large file       |
-| 0x04        | 0x84         | 4 octets        | 65536 <= K < 2^32     | Extra-large file |
+| Bit | Name | Mask | Desc |
+|---|---|---|---|
+| A | ACK | 0x80 | Acknowledgement flag |
+| B | BID | 0x40 | Bridge flag (target/source, 4 octets each) |
+| C | CMD | 0x20 | Whether a command follows (4 octets) |
+| D | DSN | 0x10 | Whether a serial number follows (4 octets) |
+| E | LEN | 0x0F | Segment parameter width (0/1/2/4) |
 
-**Head Length** is derivable from Type but kept as a fast self-check.
+**Head size** (1 octet):
 
-**Body Length** must satisfy `head_length + body_length <= MSS`.
+    N = 8 + 8*B + 4*D + 2*E + 4*C
 
-### 2.3 Envelope (fixed, 12 octets)
+Must satisfy 8 ≤ N ≤ 32 and equal the 2nd head octet; E is allowed to be 0/1/2/4 only — other values and non-derivable head sizes are error packets.
 
-| Field           | Width | Meaning                              |
-| --------------- | ----- | ------------------------------------ |
-| Target Bridge ID| 4     | Destination bid                      |
-| Source Bridge ID| 4     | Originator bid (ACKs return here)    |
-| Serial Number   | 4     | Message identity at the source       |
+**Body size** (2 octets): head + body = total ≤ MSS (1232), otherwise an error packet.
 
-**Serial number** increments **per original message**, not per packet.
-Segments of one message share the same `sn`; receivers identify and
-deduplicate a (message, segment) pair by combining `sn` and `index`:
+### 1.4 Variable Parameter Area
 
-```
-if type & 0x80 == 0:
-    mid = sn
-else:
-    mid = (sn << (type & 0x0F)) | index
-```
+| # | Variable | Length |
+|:---:|------|-----:|
+| 1 | target bid | 4 bytes |
+| 2 | source bid | 4 bytes |
+| 3 | serial number (dsn) | 4 bytes |
+| 4 | index | 1/2/4 bytes |
+| 5 | count | 1/2/4 bytes |
+| 6 | command | 4 bytes |
 
-### 2.4 Parameter Area (0 / 2 / 4 / 8 octets)
+- **B=1**: carries target/source; after validation the server relays unchanged if target is non-zero. B=0 means a client-direct packet; sending it to the server is an error.
+- **D=1**: carries dsn, used only by normal data packets and their COPY replies; system commands (handshake/heartbeat/farewell) use D=0, carry no dsn, and the sender needs no wait-for-reply queue.
+- **index/count**: present when E>0; 0 ≤ index < count and count ≥ 2; E=0 means no parameters (equivalent to index=0, count=1).
+- **C=1**: the last 4 head octets are a command (values in the workflow document).
 
-Present only when `Type != 0`:
+### 1.5 Splitting & Deduplication
 
-```
-+-----------------+-----------------+
-| index (w octets)| count (w octets)|
-+-----------------+-----------------+
-```
+dsn increments per original (pre-split) packet; sub-packets of one split share the dsn, so the receiver deduplicates by dsn+index (mid is a 64-bit unsigned integer):
 
-- `count` — total number of segments (`>= 1`).
-- `index` — zero-based segment ordinal, `0 <= index < count`.
-- Head sizes follow: 20 (no params), 22 (w=1), 24 (w=2), 28 (w=4).
-
-## 3. Body
-
-- Carries the application payload.
-- Maximum size `N = 1200`; empty body is allowed (e.g., bare ACKs).
-
-## 4. Payload Size Analysis (MSS and N)
-
-### 4.1 Upper Bound
-
-To avoid IP fragmentation, each emitted datagram must fit the minimum MTU
-any path guarantees. RFC 8200 mandates an IPv6 minimum link MTU of 1280.
-
-```
-MSS = 1280 - 40 (IPv6 header) - 8 (UDP header) = 1232
+```mermaid
+flowchart TD
+    P[packet received] --> E{E > 0?<br/>segmented}
+    E -- no --> M1[mid = dsn]
+    E -- yes --> M2[mid = dsn << 8*E | index]
+    M1 --> T[dedup table]
+    M2 --> T
+    T -- exists --> DR[drop]
+    T -- new --> ACC[accept]
 ```
 
-1232 matches the widely deployed DNS Flag Day 2020 EDNS(0) recommendation.
+> Deduplication applies to data packets (replies included) only; system commands (D=0) are excluded.
 
-### 4.2 Body Limit
+## 2. Body
 
-The head is at most 28 octets (20 fixed + 8 parameter area); the theoretical
-maximum body is `1232 - 28 = 1204`. The protocol reserves a 32-octet head
-budget:
+- **Business limit**: N = 1024 octets (1 KiB)
+- **Transport hard limit**: MSS = 1232 octets (UDP payload)
+
+### 2.1 MSS & Body Limit Decision
+
+```mermaid
+flowchart LR
+    M[IPv6 min MTU 1280] -->|− IPv6 40| U[− UDP 8 = MSS 1232]
+    U -->|− max head 32| C1[theoretical body 1200<br/>IP packet = 1280, zero buffer]
+    U -->|business limit| C2[N = 1024<br/>IP packet = 1104, buffer 176]
+    C1 -. fragments under nested tunnels .-> C2
+```
 
 ```
-N = MSS - 32 = 1200
+    MSS = 1232  # 1280 - 40 - 8（IPv4 UDP limit 1472, IPv6 MTU1500 limit 1452）
 ```
 
-### 4.3 Evaluation — keep N = 1200
+- Total IP datagram = head(32) + body(1024) + UDP(8) + IPv6(40) = **1104 octets**;
+- Buffer = 1280 − 1104 = **176 octets**: one medium tunnel layer (WireGuard 60–80B, OpenVPN UDP 60–70B) or two lightweight layers (1280−60−60=1160>1104) still avoids re-fragmentation;
+- With 1200 (IP packet exactly 1280), nested tunnels fragment easily (e.g. 1280−50 IPSec−24 GRE leaves only 1158B usable).
 
-1. **Consistent with QUIC.** RFC 9000 mandates a 1200-octet initial
-   datagram (entire UDP payload, including QUIC header). It is battle-tested
-   across PPPoE (MTU 1492), VPN tunnels (~1400), and mobile networks; a
-   1200-octet body plus a 28-octet head (1228 total) stays within the same
-   budget.
-2. **Headroom.** `1228 <= 1232` leaves 4 octets for future head extensions
-   (e.g., a hop-count field) without touching `N`.
-3. **Round number.** 1200 is easy to reason about, test, and document; the
-   cost vs. the theoretical 1204 is negligible (0.3%).
+### 2.2 Segment Size Classes
 
-Optional future work: Datagram PLPMTUD (RFC 8899) to raise the limit per
-destination (e.g., 1472 on plain IPv4 Ethernet); `N` remains the safe
-protocol-wide default.
+| E | Param width | Class | Upper bound |
+|---|---|---|---|
+| 0 | — | mini message | ≤ 1024 B |
+| 1 | 1 byte | small file | ≤ 255 KiB (255×1024 = 261,120 B) |
+| 2 | 2 bytes | normal file | ≤ 64 MiB (65535×1024 ≈ 67,107,840 B) |
+| 4 | 4 bytes | large file | ≤ 4096 GiB ((2³²−1)×1024 ≈ 4,398,046,511,104 B) |
+
+> Binary units (KiB/MiB/GiB); exact value = count upper bound × 1024; 64 MiB exactly = 64 MiB − 1 KiB, 4096 GiB exactly = 4096 GiB − 1 KiB.

@@ -1,111 +1,84 @@
-# Magpie Bridge 工作流 — 设计
+# Magpie Bridge 工作流设计
 
-> Magpie Bridge 的连接工作流：握手、发送、心跳、挥手。
-> 需求来源：`tasks/110-design-workflow.md`。报文格式见 `design-protocol.md`。
+角色分**客户端**和**转发服务器**两种：可直连优先直连（B=0），否则经服务器转发（B=1）。服务器彼此独立，客户端按连通速度自选。
 
-## 1. 角色与选路
+> 系统指令（握手/挥手/心跳）一律 **D=0**，不携带 dsn；应答按 **socket 配对**（从哪个 socket 收到就回哪个）。服务器场景下 source bid 仅作身份校验，不参与应答寻址。发送方无需维护等待应答队列。
 
-- 两种角色：**客户端**和**转发服务器**（即"桥"）。
-- 两个客户端 A、B 能直连则优先直连，否则经服务器 S 转发。
-- 转发服务器彼此独立；客户端根据连通速度自行选择服务器。
+## 1. 握手机制（建立连接）
 
-## 2. 握手机制（搭桥）
+### 1.1 客户端 ↔ 服务器（申请 bid）
 
-### 2.1 客户端 to 服务器（申请 bid）
+```mermaid
+sequenceDiagram
+    participant C as 客户端
+    participant S as 服务器
+    C->>S: SYN? (target=0, source=0)
+    Note right of C: SYN_SENT
+    S-->>C: SYN! (target=x, source=0) + socket 信息
+    Note right of S: SYN_RCVD
+    C->>S: ACK! (target=0, source=x)
+    S->>S: 校验 x↔socket，指派接待线程
+    Note over C,S: ESTABLISHED，连接建立
+```
 
-客户端须先向服务器申请 bid，之后其他客户端才能凭 bid 请求服务器协助转发。
+### 1.2 客户端 ↔ 客户端（B=0，直连）
 
-1. **第一次握手**：客户端发送 `SYN`（target/source bid 均为 0，`sn` 为
-   己方起始序列号），进入 `SYN_SENT` 状态。
-2. **第二次握手**：服务器回复 `SYN+ACK`（target bid 为根据 socket 分配的
-   随机整数 x，source bid 为 0，`sn` 为己方起始序列号），进入 `SYN_RCVD`
-   状态。可同时附带客户端 socket 信息，如包体
-   `{"udp":"12.34.57.78:12345"}`，`body_size = len(body)`。
-3. **第三次握手**：客户端回复 `ACK`（target bid 为 0，source bid 为刚
-   收到的 x）；服务器验证后将 x 与 socket（ip:port）一起指派给服务线程，
-   双方进入 `ESTABLISHED` 状态。
+```mermaid
+sequenceDiagram
+    participant A as 客户端 A
+    participant B as 客户端 B
+    A->>B: SYN?（无 bid 字段）
+    Note right of A: SYN_SENT
+    B-->>A: SYN!
+    Note right of B: SYN_RCVD
+    A->>B: ACK!
+    Note over A,B: 双方各自标注一条“有向管道”
+```
 
-### 2.2 客户端 to 客户端（直连）
+> 服务器回复 SYN! 时可附带客户端 socket 信息（如包体 `{"udp":"12.34.57.78:12345"}`）。
 
-两个 bid 全为 0，表示直接发送、无需服务器中继。同样三步握手。直连链路
-被设计为两条**"有向管道"**，每侧各自管理自己方向的管道并在本地标注
-`ESTABLISHED`。
+## 2. 发送与应答机制
 
-### 2.3 握手参数说明
+```mermaid
+flowchart LR
+    A[发送方 A] -->|B=1 转发| S{服务器 S}
+    S -->|校验 target/source 与 socket<br/>更新活跃时间| T[接收方 B]
+    T -->|COPY: A=1,C=1,D=1<br/>target/source 对调| S
+    S -->|原样回传| A
+    A2[发送方 A] -.->|B=0 直连| T2[接收方 B]
+    T2 -.->|COPY 应答| A2
+```
 
-| 步骤    | type | sn    | 包体      | 包体长度 |
-| ------- | ---- | ----- | --------- | -------- |
-| SYN     | 0    | i     | `SYN`     | 3        |
-| SYN+ACK | 128  | i     | `SYN+ACK` | 7        |
-| ACK     | 128  | i + 1 | `ACK`     | 3        |
+- 数据包：A=0, D=1（command 可无或 "DATA"），dsn 自增，携带实际分片信息；
+- 收到普通数据包即回 **COPY**（A=1, C=1, D=1，回填源 dsn/index/count）；B=1 时 target/source 对调；
+- 服务器转发不回应答，发送方凭接收方 COPY 确认收到；
+- 系统指令（D=0）不回复 COPY，回各自专用应答（SYN!/PONG/FIN!）。
 
-## 3. bid 规则
+## 3. 挥手机制（关闭连接）
 
-- bid 是客户端首次连接服务器时分配的整数（"门牌号"）；客户端通过其他
-  途径广播给其他用户。
-- `target bid == 0` → 报文是发给服务器自身的（用于握手/挥手）。
-- `source bid == 0` → 只可能是服务器下发的包；客户端不得填写。客户端
-  填 source bid 为 0 而 target bid 非 0 会被服务器判定非法丢弃；source
-  bid 与服务器对该 socket 的记录不符也会被丢弃。
-- 服务器只对 **target/source bid 均非 0 且均正确** 的包执行转发：分别
-  查询两个 bid，正确则**原样转发**到 target bid 对应 socket（不做任何
-  改动）。
+```mermaid
+sequenceDiagram
+    participant A as 客户端 A
+    participant P as 对端（服务器/客户端）
+    A->>P: FIN?（数据发完，关闭本侧）
+    Note right of A: FIN_WAIT
+    P-->>A: FIN!
+    P->>P: 直接关闭
+    A->>A: 收到后关闭（或 2MSL 超时）
+```
 
-## 4. 发送机制
+> 直连场景为两条"有向管道"，各管道由发起方主动 FIN 关闭；对端被动关闭后主动发起反方向关闭，总体接近 TCP 四次挥手。
 
-### 4.1 经服务器转发
+## 4. 心跳机制（保活）
 
-1. 客户端 A、B 先在同一服务器 S 上注册 bid。
-2. A 将双方 bid 填入协议头，将数据发送给 S。
-3. S 检查：target bid 存在且**活跃**（规定时间 T 内有上行数据包），
-   source bid 与当前 socket 匹配；通过后更新 A 的活跃时间，原样转发。
-4. S 协助转发时不回复应答包；A 通过 B 自动回复的应答包确认收到。
+```mermaid
+sequenceDiagram
+    participant C as 客户端
+    participant S as 服务器/对端
+    Note over C: 超过预设时间无任何包（含应答）发送
+    C->>S: PING（B=1 时 target=0, source=本机 bid）
+    S-->>C: PONG
+    Note over C,S: 连接保持活跃
+```
 
-### 4.2 直接发送
-
-握手建立"连接"后，A 直接将数据包发给 B（bid 字段填 0）。
-
-### 4.3 应答确认（B -> A）
-
-B 收到数据包后（无论是直连还是经服务器转发），必须回复应答包：
-
-- `type >= 128`（收到的 type 与 0x80 做"或"运算）；
-- 包体 = `OK`（2 字节）；
-- target/source bid 对调（直连则全为 0，也可对调）；
-- `sn` 原样复制；
-- `index`/`count`（如有）原样复制。
-
-## 5. 心跳机制（保活）
-
-客户端定期检查自身的发送时间，若超过预设时间没有任何数据包（包括应答
-包）发送，则主动发送心跳包维持"连接"状态。
-
-1. **发起**：A 向 B/S 发送 `PING` —— `sn` 为己方自增 i，`type` = 0，
-   包体 = `PING`（4 字节）。
-2. **应答**：B/S 自动回复 `PONG` —— `sn` 为收到的 i，`type` = 128，
-   包体 = `PONG`（4 字节）。
-
-说明：
-
-- 服务器无需主动发起心跳，C-S 结构的连接状态由客户端负责维护；
-- 客户端直连时，两条"有向管道"各自由发起方主动维护。
-
-## 6. 挥手机制（关闭连接）
-
-不同于 TCP 的 4 次挥手，这里直接关闭：
-
-1. **主动关闭**：A 发送 `FIN`（包体 `FIN`，3 字节）给 S（或 B），进入
-   `FIN_WAIT` 状态。
-2. **被动关闭**：S（或 B）收到后回复 `ACK`，然后直接关闭。
-3. A 收到该 `ACK` 后（或等待 2MSL 仍未收到）直接关闭。
-
-直连情况下存在两条"有向管道"，每条连接都是发起方主动发 FIN 后即可关闭；
-另一侧被动关闭这条管道后，会接着主动发起反方向管道的关闭流程，总体上
-与 TCP 的 4 次挥手差不多。
-
-### 6.1 挥手参数说明
-
-| 步骤    | type | sn | 包体      | 包体长度 |
-| ------- | ---- | -- | --------- | -------- |
-| FIN     | 0    | i  | `FIN`     | 3        |
-| FIN+ACK | 128  | i  | `FIN+ACK` | 7        |
+> 服务器不主动发起心跳，连接状态由客户端维护。

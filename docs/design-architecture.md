@@ -1,91 +1,85 @@
-# Magpie Bridge Architecture — Design
+# Magpie Bridge Architecture Design
 
-> Server-side architecture of Magpie Bridge.
-> Source of requirements: `tasks/120-design-architecture.md`.
-> Packet format: see `design-protocol.md`; workflows: see
-> `design-workflow.md`.
+The network is an **N:1 C-S structure**: S is a discrete relay node serving only clients registered on it; servers are not associated with each other and offer nothing but simple relay.
 
-## 1. Network Structure
+## 1. System Architecture
 
-- N:1 client-server topology; the server S is a **discrete forwarding
-  node**.
-- One server can efficiently serve many clients, but only clients
-  **registered on that server**.
-- The server provides the simplest relay only and **does not associate
-  with other servers**.
-
-## 2. Server Design Overview
-
-- **Receive/send separation**: receiving and forwarding are handled by
-  separate threads.
-- The server keeps an in-memory mapping table **`yellow_pages`**:
-  `bid -> socket`.
-
-Data flow:
-
-```
-UDP port
-   |
-   v
-[Receiver thread] --(packet + socket)--> [Preprocessor queue]
-                                               |
-                 +-----------------------------+-----------------+
-                 v                                               v
-        [Manager thread] (target=0)                  [Forward threads x256]
-        handshake / heartbeat / teardown             relay to target socket
+```mermaid
+graph TB
+    subgraph CL[Clients]
+        A[Client A<br/>bid=a]
+        B[Client B<br/>bid=b]
+        C[Client C<br/>bid=c]
+    end
+    subgraph SV[Relay Server]
+        S[Server S<br/>yellow_pages: bid→socket]
+    end
+    A -- "B=1 relay" --> S
+    B -- "B=1 relay" --> S
+    C -- "B=1 relay" --> S
+    S -- "forward by target bid, unchanged" --> A
+    S -- "forward by target bid, unchanged" --> B
+    A -. "B=0 direct" .-> B
+    B -. "B=0 direct" .-> C
 ```
 
-## 3. Thread Model
+Key points:
 
-### 3.1 Receiver Thread
+- Direct (B=0, no bid fields) is preferred when possible; otherwise relay via the server (B=1);
+- The server only maps bid→socket via yellow_pages and forwards packets unchanged;
+- Clients obtain a bid by handshake and broadcast it; others relay by that bid.
 
-- Binds **one** UDP port on startup.
-- Pushes every received packet, together with its socket info, into the
-  preprocessor wait list **without any judgment**.
-- Because only one UDP port is used, fd usage does not grow with the
-  number of clients.
+## 2. Server Internals
 
-### 3.2 Preprocessor Thread
+```mermaid
+flowchart LR
+    UDP[UDP port<br/>receiver thread] -->|packet + socket| PRE[preprocessor thread]
+    PRE -->|validation chain| CHK{target bid?}
+    CHK -- 0 --> MGR[manager thread<br/>handshake/heartbeat/farewell]
+    CHK -- non-0 --> FWD[forwarder threads ×256<br/>n = source bid % 256]
+    MGR --> YP[(yellow_pages<br/>bid→socket)]
+    FWD --> YP
+    FWD -->|forward unchanged| TGT[socket of target bid]
+```
 
-Pops a packet from the wait list and:
+**Preprocessor validation chain** (drop on any failure):
 
-1. **Validate the head** — any error → drop and exit.
-2. **target bid == 0** → hand to the manager thread.
-3. **source bid == 0** → invalid here → drop and exit.
-4. Look up `yellow_pages`: source bid's socket must match the record;
-   otherwise drop.
-5. On match, update the active time and assign the packet to a forward
-   thread.
+```mermaid
+flowchart TD
+    P[dequeue packet] --> V1[validate head]
+    V1 -- error --> DR[drop]
+    V1 -- OK --> V2{B=1?}
+    V2 -- no --> DR
+    V2 -- yes --> V3{target=0?}
+    V3 -- yes --> M[hand to manager]
+    V3 -- no --> V4{source=0?}
+    V4 -- yes --> DR
+    V4 -- no --> V5{bid↔socket match?}
+    V5 -- no --> DR
+    V5 -- yes --> UP[refresh liveness → forwarder]
+```
 
-> Note: `source bid == 0` implies `target bid == 0` as well; such packets
-> exist only as the 1st handshake and were already routed by step 2.
+| Thread | Responsibility |
+|---|---|
+| Receiver | Binds one UDP port; enqueues packets without judgment |
+| Preprocessor | Validates head, B=1, target/source legality, bid↔socket match; refreshes liveness |
+| Manager | Handles 1st/3rd handshake, PING, FIN?; unknown command dropped |
+| Forwarder ×256 | Sharded by source bid % 256, breadth-first polling, forward unchanged |
 
-### 3.3 Manager Thread
+> source=0 exists only in the 1st handshake packet (then target must be 0); source=0 with target≠0 is an error packet and is dropped.
 
-Handles packets from the management queue:
+## 3. Manager Thread Handling
 
-| Case                          | Criterion                      | Action                                   |
-| ----------------------------- | ------------------------------ | ---------------------------------------- |
-| 1st handshake                 | source bid == 0 (body `SYN`)   | allocate a free bid, register the socket, reply |
-| 3rd handshake                 | source bid > 0 (body `ACK`)    | compare socket with record; drop on mismatch; update active time |
-| Heartbeat                     | body `PING` (source bid > 0)   | reply `PONG`, update active time         |
-| Teardown                      | body `FIN` (source bid > 0)    | delete record, release the bid           |
+```mermaid
+flowchart LR
+    Q[management request] --> T{recognize}
+    T -- source=0<br/>"SYN?" --> H1[1st handshake<br/>assign bid, register socket, reply SYN!]
+    T -- "ACK!"<br/>source>0 --> H3[3rd handshake<br/>validate socket, assign forwarder]
+    T -- "PING"<br/>source>0 --> HB[heartbeat<br/>reply PONG, refresh liveness]
+    T -- "FIN?"<br/>source>0 --> FW[farewell<br/>remove record, release bid]
+    T -- other --> UN[unknown command dropped]
+```
 
-### 3.4 Forward Threads (N = 256)
+## 4. Flow Control
 
-- On startup the server spawns N forward threads (default 256).
-- The preprocessor assigns a task by hashing: `n = source bid % N`, then
-  queues the packet on forward thread `n`.
-- Each forward thread keeps one waiting queue **per source bid**.
-
-**Forward thread runloop** — fair, breadth-first:
-
-1. Poll its source bids; if a queue is non-empty, take its head packet.
-2. If all queues are empty, sleep briefly and continue.
-3. Look up the packet's target bid in `yellow_pages`: if missing or
-   inactive, drop and continue.
-4. Send the packet to the target bid's socket over the bound UDP interface.
-
-**Flow control**: a limit on the number of tasks processed per time window
-prevents traffic storms; since tasks are split across 256 threads, a storm
-on one thread does not affect the others and is contained to a small scope.
+Forwarder threads throttle (a cap on tasks per time window). Tasks are sharded across 256 threads by `source bid % 256`, so one thread hitting its cap does not affect the others, confining any storm to a very small scope.
