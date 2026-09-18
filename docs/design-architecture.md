@@ -1,114 +1,84 @@
 # Magpie Bridge Architecture Design
 
-The network structure is **N:1 client-server**: server S is a discrete relay node that serves many clients efficiently, but only those registered on it. The server only provides minimal relaying and is not linked to other servers.
+## Topology
 
-## 1. System Architecture
+N:1 C-S structure. Server S is an independent relay node, serving only clients registered on it.
+
+```mermaid
+flowchart TD
+    subgraph Clients
+        A["Client A<br/>bid=100"]
+        B["Client B<br/>bid=200"]
+        C["Client C<br/>bid=300"]
+    end
+    A -.->|"direct B=0"| B
+    A -->|"relay B=1"| S
+    B -->|"relay B=1"| S
+    C -->|"relay B=1"| S
+    S["Server S<br/>yellow_pages: bid to socket"]
+```
+
+## Server Thread Model
+
+Receive and forward are separated:
 
 ```mermaid
 flowchart LR
-    subgraph clients
-        C1[Client 1]
-        C2[Client 2]
-        C3[Client N]
-    end
-    subgraph relay
-        S[Relay server S<br/>single UDP port]
-    end
-    C1 -->|"UDP packets"| S
-    C2 -->|"UDP packets"| S
-    C3 -->|"UDP packets"| S
-    S -->|"relay by target bid"| C2
-    S -->|"relay by target bid"| C3
-    C1 -. direct B=0 .- C2
+    UDP["UDP port"] --> R["Receiver thread"]
+    R --> WQ["Preprocess queue"]
+    WQ --> P["Preprocess thread"]
+    P -->|"target=0 or mgmt"| MQ["Mgmt queue"]
+    P -->|"forward"| D["Forward threads N=256"]
+    MQ --> M["Mgmt thread"]
+    D --> T["Send to target socket"]
+    M --> SYS["assign bid / verify / ping / teardown"]
 ```
 
-- The server keeps an in-memory **yellow_pages: bid → socket** mapping table;
-- A client applies for a bid (doorplate) via handshake; other clients can then request relaying by bid.
+### Receiver Thread
 
-## 2. Server Internals (Separated RX/TX)
+Binds a single UDP port; on receive, pushes packet + socket into the preprocess queue. No extra fd as users grow.
 
-Receiving and forwarding are handled by **separate threads**: the receiver only receives; N=256 forwarding threads only send.
-
-```mermaid
-flowchart LR
-    UDP[(UDP port<br/>single binding)] --> R[Receiver thread]
-    R -->|"push raw, no judgment"| Q1[Preprocess wait list]
-    Q1 --> PP[Preprocess thread<br/>validate and assign]
-    PP -->|"target=0 system cmds"| MQ[Manage request queue]
-    PP -->|"data packets"| Q2[Forward queues<br/>assigned by source bid mod]
-    MQ --> MT[Manager thread<br/>handshake/heartbeat/wave]
-    Q2 --> FT1[Forward thread 1]
-    Q2 --> FT2[Forward thread 2]
-    Q2 --> FTN[Forward thread 256]
-    MT -->|"SYN! / PONG etc."| UDP
-    FT1 -->|"UDP send"| UDP
-    FT2 -->|"UDP send"| UDP
-    FTN -->|"UDP send"| UDP
-```
-
-- **Receiver thread**: binds one UDP port, pushes each packet with its socket info into the preprocess wait list without any judgment. One UDP port means fd usage does not grow with users;
-- **Preprocess thread**: validates and assigns (see below);
-- **Manager thread**: handles system commands such as handshake / heartbeat / wave;
-- **Forward threads (N=256)**: poll and send data packets.
-
-## 3. Preprocess Validation Chain
+### Preprocess Thread
 
 ```mermaid
 flowchart TD
-    P[take packet + socket] --> V1{head valid?}
-    V1 -- bad --> DR[drop]
-    V1 -- ok --> V2{B=1?<br/>server only handles bridged}
-    V2 -- no --> DR
-    V2 -- yes --> V3{target bid = 0?}
-    V3 -- yes --> MG[hand to manager thread]
-    V3 -- no --> V4{source bid = 0?}
-    V4 -- yes --> DR
-    V4 -- no --> V5{bid matches socket?<br/>lookup yellow_pages}
-    V5 -- no --> DR
-    V5 -- yes --> UP[update liveness]
-    UP --> AS[assign forward thread<br/>n = source bid % 256]
+    P["Take packet"] --> V1["Validate header"]
+    V1 -->|"fail"| DROP["Drop"]
+    V1 --> V2{"B = 1?"}
+    V2 -- "No" --> DROP
+    V2 -- "Yes" --> T{"target = 0?"}
+    T -- "Yes" --> MGT["To mgmt thread"]
+    T -- "No" --> SRC{"source = 0?"}
+    SRC -- "Yes" --> DROP
+    SRC -- "No" --> CHK{"socket matches yellow_pages?"}
+    CHK -- "No" --> DROP
+    CHK -- "Yes" --> UPD["Update last-active"]
+    UPD --> DISP["n = source % N, dispatch to thread n"]
 ```
 
-> source=0 implies target=0 (only true for the 1st handshake packet); source=0 with target≠0 is a bad packet and dropped.
+### Management Thread
 
-## 4. Manager Thread
+Handles management packets with target=0:
 
-Takes packets from the manage queue and identifies the command type; unknown commands are dropped.
+| Type | Key | Action |
+|------|-----|--------|
+| SYN? | source=0 | allocate bid, bind socket, reply SYN! |
+| ACK! | command=ACK! and source>0 | verify socket, dispatch to forward thread |
+| PING | command=PING | reply PONG, update last-active |
+| FIN? | command=FIN? | delete record, release bid |
+
+### Forward Threads (N=256)
+
+Sharded by `n = source_bid % N`; each forward thread holds send queues per source bid.
 
 ```mermaid
 flowchart TD
-    P[take manage request] --> C{classify}
-    C -->|"source bid = 0<br/>(command should be SYN?)"| H1[1st handshake]
-    C -->|"command = ACK!<br/>source bid > 0"| H3[3rd handshake]
-    C -->|"command = PING<br/>source bid > 0"| HB[heartbeat]
-    C -->|"command = FIN?<br/>source bid > 0"| FW[wave]
-    C -->|"unknown command"| DR[drop]
-    H1 --> H1A[allocate free bid<br/>register socket]
-    H1A --> H1B[reply SYN!<br/>no forward thread assigned]
-    H3 --> H3A[lookup source bid]
-    H3A --> H3B{socket matches?}
-    H3B -- no --> DR
-    H3B -- yes --> H3C[update liveness<br/>assign forward thread]
-    HB --> HB1[reply PONG<br/>update liveness]
-    FW --> FW1[delete record<br/>release bid]
+    L["Round-robin over source bids"] --> Q{"queue non-empty?"}
+    Q -- "No" --> SLEEP["sleep briefly"] --> L
+    Q -- "Yes" --> POP["Dequeue packet"]
+    POP --> T{"target exists & active?"}
+    T -- "No" --> DROP["Drop"] --> L
+    T -- "Yes" --> SEND["Send to target socket"] --> L
 ```
 
-## 5. Forward Threads (N=256)
-
-When assigning, the preprocess thread computes `n = (source bid) % N` and hands the packet to thread n; each thread keeps one wait queue per source bid.
-
-```mermaid
-flowchart TD
-    L[start polling] --> S[poll source bids]
-    S --> E{any queue non-empty?}
-    E -- no --> SL[sleep briefly]
-    SL --> L
-    E -- yes --> T[take front packet<br/>lookup target bid]
-    T --> A{exists and active?}
-    A -- no --> DR[drop, next loop]
-    A -- yes --> SEND[send via UDP to<br/>target socket]
-    SEND --> L
-```
-
-- **Breadth-first**: polls queues of all source bids, so one user flooding cannot starve others;
-- **Rate limiting**: a cap on tasks per time unit prevents traffic storms; since work is split across 256 threads, one thread hitting its cap does not affect others, containing storms to a small scope.
+**Flow control**: per-thread rate limit; one flood cannot affect other threads.

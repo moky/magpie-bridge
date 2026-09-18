@@ -33,7 +33,7 @@
 	- flagBid  : 桥接标志位，取值范围 0 或 1
 	- flagCmd  : 命令标志位，取值范围 0 或 1 （普通数据包默认取 0）
 	- flagDsn  : 序列号标志位，取值范围 0 或 1
-	- extLen   : 额外参数长度，取值范围 0/1/2/4
+	- extLen   : 额外参数长度，解包时 E = type & 0x07（低 3 位），允许 0~4；打包时为字节对齐仅取 0/2/4
 	- headSize : 包头大小，取值范围 8 - 32
 	- bodySize : 包体大小，取值范围 0 - 1024
 - 扩展方法
@@ -50,20 +50,20 @@
 
 |     | BridgePacket (C-S)   | DirectPacket (C-C)   | 说明                 |
 |-----|----------------------|----------------------|---------------------|
-| 握手 | syn(info)            | syn(info)            |                     |
+| 握手 | syn()                | syn()                |                     |
 |     | synAck(target, info) | synAck(info)         | target 为新分配 bid  |
-|     | ack(source, info)    | ack(info)            |                     |
-| 发送 | data(target, source, index, count, body) | data(index, count, body) | |
-|     | copy(magpie, info)   | copy(magpie, info)   | 应答参数从 magpie 复制 |
-| 心跳 | ping(source, info)   | ping(info)           |                     |
-|     | pong(target, info)   | pong(info)           |                     |
-| 挥手 | fin(source, info)    | fin(info)            |                     |
-|     | finAck(target, info) | finAck(info)         |                     |
+|     | ack(source)          | ack()                |                     |
+| 发送 | data(target, source, sn, index, count, body) | data(sn, index, count, body) | |
+|     | copy(magpie)         | copy(magpie)         | 应答参数从 magpie 复制 |
+| 心跳 | ping(source)         | ping()               |                     |
+|     | pong(target)         | pong()               |                     |
+| 挥手 | fin(source)          | fin()                |                     |
+|     | finAck(target)       | finAck()             |                     |
 
 注：
 
-1. 除了“发送”数据报之外，其余各个命令都可以携带一个可选的附加信息 info；
-2. 其中 synAck 命令的 info 为当前客户端的 socket 信息，其余 info 暂时都为空；
+1. 除了“发送”数据报之外，其余各命令都可以携带一个可选参数 info 放在协议体当作附加信息；
+2. 其中 synAck 命令的 info 为当前客户端的 socket 信息，其余命令的 info 暂时都为空；
 3. 以上方法返回对象均为 MessagePacket，标志位和字段值默认按协议规定设置。
 
 ### 数据报解析器

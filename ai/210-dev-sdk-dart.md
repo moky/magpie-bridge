@@ -1,4 +1,4 @@
-# Magpie SDK (Dart)
+# Magpie SDK (Dart 版)
 
 由于 Dart 语言对函数变量、空安全等特性更丰富，所以这里以 Dart 语言举例。
 
@@ -53,7 +53,7 @@ class MessagePacket implements Magpie {
 
     final int command;
     
-    Uint8List? body;
+    final Uint8List? body;
     
     //
     // TODO: overrides
@@ -315,7 +315,7 @@ final class MessageParser implements MagpieParser {
 	    }
 	    // 1. 前 8 个字节的有效性检查
 	    //    检查 Magic Code；
-	    //    读出 flags，检查 ext 的合法性；
+	    //    读出 flags，检查 E 合法性：E = type & 0x07（低 3 位，bit 3 不检查）；
 	    //    读出 headSize 和 bodySize，然后与 flags 一起计算检查头长度合法性；
 	    
 	    // 2. 头参数的有效性检查
